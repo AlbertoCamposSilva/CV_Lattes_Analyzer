@@ -1,11 +1,13 @@
 from datetime import datetime
 from shutil import ExecError
-import pytz, json
+import pytz, json, time
 from collections import OrderedDict
 from Lattes import Lattes
-import psycopg2
+import psycopg2, requests, json
 from Database import Database
 from functools import wraps
+import numpy as np
+
 
 class Indicadores:
 
@@ -14,13 +16,20 @@ class Indicadores:
                   json = None, 
                   filename = None, 
                   show_execution_time = False,
-                  show_sql = False
+                  show_sql = False,
+                  auto_save_json_to_bd = False,
+                  on_conflic_update = True,
+                  show_messages = False,
                   ):
         self.id = id
+        self.erro = False
         self.filename = filename
         self.show_execution_time = show_execution_time
+        self.show_messages = show_messages
+        self.on_conflic_update = on_conflic_update
         self.show_sql = show_sql
-        self.db = Database('CNPq')
+        self.auto_save_json_to_bd = auto_save_json_to_bd
+        self.db = Database('CNPq', show_sql = show_sql)
         self.indicadores = []
         self.list_indicadores = []
         self.lista_de_publicações = []
@@ -32,20 +41,25 @@ class Indicadores:
             'sub-area': [],
             'especialidade': []
         }
-        self.dados_pessoais = None
+        self.dados_gerais = None
         self.publicações=[]
 
         #Pegando o Lattes
-        self.lattes = Lattes(id)
-        if not id == None and json == None:
-            self.lattes.get_lattes()
-        elif not json == None:
-            self.get_dados_pessoais()
+        
+        if not self.id == None:
+            self.lattes = Lattes(id, auto_save_json_to_bd = self.auto_save_json_to_bd)
+            if self.lattes.get_lattes():
+                self.get_dados_gerais()
+            else:
+                self.db.execute(f'update all_lattes set erro = true where id = {self.id}')
+                self.erro = True
         elif not filename == None:
             load = False
             if filename[:-3].lower() =="zip":
                 load = self.lattes.read_zip_from_disk(filename=filename)
-                if load: load = load and self.lattes.get_xml()
+                if load: 
+                    self.lattes.get_lattes()
+                    self.get_dados_gerais()
             elif filename[:-3].lower() =="json":
                 load = load and self.lattes.read_json_from_disk(filename=filename)
             if not load:
@@ -124,25 +138,26 @@ class Indicadores:
 
 
     @timing
-    def salva_indicadores_no_bd (self, on_conflic_update = True):
+    def salva_indicadores_no_bd (self):
         if self.list_indicadores == None or len(self.list_indicadores) == 0: return False
-        args_str = ','.join((self.db.cur.mogrify("(%s,%s,%s,%s,%s)", x).decode("utf-8")) for x in self.list_indicadores)
         sql = ''
-        if on_conflic_update:
-            sql += f'''
-                delete from public."indicadores" where id = %s;'''
-        sql += '''
+
+        #Apgando se for para atualizar
+        if self.on_conflic_update:
+            sql = f'delete from public."indicadores" where id = %s;'
+            sql = self.db.cursor.mogrify(sql, [int(self.id)])
+            if self.show_sql: print (sql)
+            self.db.execute(sql)
+
+        #Inserindo
+        args_str = ','.join((self.db.cur.mogrify("(%s,%s,%s,%s,%s)", x).decode("utf-8")) for x in self.list_indicadores)
+        sql = '''
                 insert into public."indicadores"
                     (id, ano, path, tipo, qty)
                 VALUES ''' + (args_str) + ';'
-        if on_conflic_update:
-            sql = self.db.cursor.mogrify(sql, [self.id])
-            if self.show_sql: print (sql)
-            self.db.execute(sql)
-        else:
-            if self.show_sql: print (sql)
-            self.db.execute(sql)
-        return True
+        sql = self.db.cursor.mogrify(sql)
+        if self.show_sql: print (sql)
+        return self.db.execute(sql)
 
     def return_first_element_of(self, x):
         if x == None : return None
@@ -216,33 +231,29 @@ class Indicadores:
                 elif isinstance(v, list):
                     num = 0
                     for item in v:
-                        #print("Unfolding List: ", v)
                         procura_palavras_chave(json = item, path = path + [k] + [num], palavras_chave = palavras_chave)
                         num +=1
                 else:
                     if not v == None:
-                        #print(k[0:14], path, v)
                         if k[0:15] == '@PALAVRA-CHAVE-':
-                            if (len(v) > 2): 
+                            if (len(v) > 2):
                                 if not v in palavras_chave:
                                     palavras_chave.append(v)
-                        #print("{2} - {0} : {1}".format(k, html.unescape(v), path))
                     else:
-                        #print("{2} - {0} : {1}".format(k, v, path))
                         pass
             return palavras_chave
-        
+
         self.palavras_chave = procura_palavras_chave(json = json, path = path, palavras_chave=palavras_chave)
         return True
 
     @timing
-    def salva_palavras_chave_no_bd (self, on_conflic_update = True):
+    def salva_palavras_chave_no_bd (self):
         if self.palavras_chave == None or len(self.palavras_chave) == 0: return False
-        if on_conflic_update:
+        if self.on_conflic_update:
             sql = "DELETE from palavras_chave WHERE id = %s;\n"
             sql = self.db.cursor.mogrify(sql, (self.id,)).decode("utf-8")
         else: sql = ''
-        args_str = ','.join((self.db.cursor.mogrify("(" + self.id + ",%s)", (x,)).decode("utf-8")) for x in self.palavras_chave)
+        args_str = ','.join((self.db.cursor.mogrify("(" + str(self.id) + ",%s)", (x,)).decode("utf-8")) for x in self.palavras_chave)
         sql += '''INSERT into palavras_chave (id, palavra)
         VALUES
             ''' + args_str
@@ -290,10 +301,10 @@ class Indicadores:
         return True
 
     @timing
-    def salva_areas_do_conhecimento_no_bd (self, on_conflic_update = False):
+    def salva_areas_do_conhecimento_no_bd (self):
         if self.areas_conhecimento == None or len(self.areas_conhecimento) == 0: return False
         sql = ''
-        if on_conflic_update:
+        if self.on_conflic_update:
             sql += self.db.cursor.mogrify('delete from public."areas_conhecimento" where id = %s;', (self.id,)).decode("utf-8")
         args_str = ','.join((self.db.cursor.mogrify("(%s,%s,%s)", x).decode("utf-8")) for x in self.areas_conhecimento)
         sql = '''
@@ -356,12 +367,12 @@ class Indicadores:
         return True
 
     @timing
-    def salva_publicações_no_bd(self, on_conflic_update = True):
+    def salva_publicações_no_bd(self):
         if self.lista_de_publicações == None or len(self.lista_de_publicações) == 0: return False
         sql = ''
         args_str = ','.join((self.db.cursor.mogrify("\n(%s, %s, %s, %s, %s, %s, %s)", x).decode("utf-8")) for x in self.lista_de_publicações)
         #print(args_str)
-        if on_conflic_update:
+        if self.on_conflic_update:
             delete_sql = '''DELETE from publicacoes WHERE id = %s;\n'''
             sql+= self.db.cursor.mogrify(delete_sql, (self.id,)).decode("utf-8")
         sql += '''INSERT INTO publicacoes (id, doi, path, tipo, titulo, ano, natureza)
@@ -372,50 +383,167 @@ class Indicadores:
         return True
 
     @timing
-    def get_dados_pessoais(self):
-        if self.lattes.json == None: return False
-        id = self.lattes.json['CURRICULO-VITAE'].get('@NUMERO-IDENTIFICADOR')
-        if not self.inteiro(id) == None and len(id) == 16:
-            id = self.inteiro(id)
-            if not self.id == None and not int(self.id) == id:
-                print('ERRO. ID da classe não é o mesmo do ID do Lattes. ID Lattes: ', id, '. ID Classe: ', self.id, '.')
-            self.id = id
-        elif self.inteiro(id) == None or not len(id) == 16:
-            if not self.id == None:
-                id = self.id
-        else:
-            return False
-        data =  self.lattes.json['CURRICULO-VITAE'].get('@DATA-ATUALIZACAO')
-        hora =  self.lattes.json['CURRICULO-VITAE'].get('@HORA-ATUALIZACAO')
-        self.lattes.data_atualizacao = datetime.strptime(data + hora, '%d%m%Y%H%M%S')
-
-        self.dados_pessoais = {
-            'id': id,
-            'nome': self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS'].get('@NOME-COMPLETO'),
-            'nacionalidade': self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS'].get('@PAIS-DE-NACIONALIDADE'),
-            'nomes_citacao': self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS'].get('@NOME-EM-CITACOES-BIBLIOGRAFICAS'),
-            'orcid': self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS'].get('@ORCID-ID'),
-        }
+    def get_dados_gerais(self):
+        self.dados_gerais = self.lattes.dados_gerais
+        self.get_sexo()
         return True
 
     @timing
-    def salva_dados_pessoais_no_bd (self, on_conflic_update = False):
-        if self.dados_pessoais == None or len(self.dados_pessoais) == 0: return False
-        sql = '''INSERT INTO dados_pessoais (id, nome, nacionalidade, nomes_citacao, orcid) VALUES (%s,%s,%s,%s,%s) '''
-        if on_conflic_update:
-            sql += '''ON CONFLICT (id) DO
-                        UPDATE SET
-                        nome = EXCLUDED.nome,
-                        nacionalidade = EXCLUDED.nacionalidade,
-                        nomes_citacao = EXCLUDED.nomes_citacao,
-                        orcid = EXCLUDED.orcid
-                        ;'''
-        else:
-            sql += 'ON CONFLICT (id) DO NOTHING;'
-        sql = self.db.cursor.mogrify(sql, [self.dados_pessoais[k] for k in self.dados_pessoais.keys()])
-        if self.show_sql: print(sql)
-        self.db.execute(sql)
+    def salva_dados_gerais_no_bd (self):
+        if self.dados_gerais == None or len(self.dados_gerais) == 0: return False
+        self.db.insert_dict ('dados_gerais', self.dados_gerais, on_conflict = ['id'])
         return True
+
+    @timing
+    def get_vinculos (self):
+        self.vinculos = []
+        if self.lattes.json == None: return False
+        atuações_profissionais = self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS'].get('ATUACOES-PROFISSIONAIS')
+        if not atuações_profissionais == None:
+            for lista_atuação in self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS']['ATUACOES-PROFISSIONAIS']:
+                #print(lista_atuação)
+                for atuacao in self.get_list(self.lattes.json['CURRICULO-VITAE']['DADOS-GERAIS']['ATUACOES-PROFISSIONAIS'][lista_atuação]):
+                    if not atuacao.get('VINCULOS') == None:
+                        anos = []
+                        instituição = None
+                        num_anos = None
+                        atual = False
+                        enquadramento = None
+                        tipo = None
+                        vinculos = atuacao['VINCULOS']
+                        instituição = atuacao.get('@NOME-INSTITUICAO')
+                        for vinculo in self.get_list(vinculos):
+                            ano_fim = None
+                            ano_inicio = None
+                            #print('\n\n', vinculo)
+                            ano_fim = self.inteiro(vinculo.get('@ANO-FIM'))
+                            ano_inicio = self.inteiro(vinculo.get('@ANO-INICIO'))
+                            if ano_fim == None and not ano_inicio == None and ano_inicio > 1800:
+                                anos.extend([*range(ano_inicio, 2020, 1)])
+                                atual = True
+                                enquadramento = vinculo.get('@ENQUADRAMENTO-FUNCIONAL')
+                                tipo = vinculo.get('@TIPO-DE-VINCULO')
+                            elif not ano_inicio == None and ano_inicio > 1800:
+                                anos.extend([*range(ano_inicio, ano_fim +1, 1)])
+                        num_anos = len(np.unique(np.array(anos)))
+                        self.vinculos.append(
+                            {
+                                'id': self.id,
+                                'instituicao': instituição,
+                                'num_anos': num_anos,
+                                'atual': atual,
+                                'enquadramento': enquadramento,
+                                'tipo': tipo,
+                            }
+                        )
+        return True
+
+    @timing
+    def salva_vinculos_no_bd (self):
+        if not self.vinculos == None and len(self.vinculos) > 0:
+            sql = '''
+                INSERT INTO vinculos
+                    (id, instituicao, num_anos, atual, enquadramento, tipo)
+                VALUES
+                    {params_list}
+                '''
+            if self.on_conflic_update:
+                sql = 'DELETE FROM vinculos WHERE id = ' + str(self.id) + ';\n' + sql
+            data = []
+            for chave in self.vinculos:
+                linha = []
+                for k,v in enumerate(chave):
+                    linha.append(chave[v])
+                data.append(linha)
+            self.db.insert_many(sql, data)
+
+    @timing
+    def get_sexo (self):
+         
+        if self.show_messages:
+            print(f"Pegando o sexo do id {self.id} com o nome {self.lattes.dados_gerais['nome']}")
+        
+        #tabela en_recursos_humanos
+        try:
+            sexo = self.db.query(f'select cod_sexo from en_recurso_humano where id = {self.id}')
+            sexo =  sexo[0][0]
+        except:
+            sexo = None
+        if self.show_messages:
+            print('Resultado da tentativa de pegar sexo na tabela en_recurso_humano por id:', sexo)
+
+        #Tabela dados_gerais    
+        if sexo == None:  
+            if self.show_messages:
+                print(f"Pegando o sexo do id {self.id} com o nome {self.lattes.dados_gerais['nome']}")
+            try:
+                sexo = self.db.query(f'select sexo from dados_gerais where id = {self.id}')
+                sexo =  sexo[0][0]
+            except:
+                sexo = None
+            if self.show_messages:
+                print('Resultado da tentativa de pegar sexo na tabela dados_gerais:', sexo)
+            
+        
+        if sexo == None:
+            if len (self.dados_gerais['nome']) > 2:
+                sql = f'''
+                    select cod_sexo 
+                    from public.en_recurso_humano 
+                    where  UPPER(unaccent(split_part(nme_rh,' ',1))) = 
+                            UPPER(unaccent(split_part('{self.dados_gerais['nome'].split(sep=" ", maxsplit=1)[0]}',' ',1)))
+                    limit 1;
+                    '''
+                try:
+                    sexo = self.db.query(sql)
+                    sexo =  sexo[0][0]
+                except:
+                    sexo = None
+            if self.show_messages:
+                print('Resultado da tentativa de pegar sexo na tabela en_recurso_humano por nome:', sexo)
+        if sexo == None:
+            if len (self.dados_gerais['nome']) > 2:
+                sexo = self.getGender (self.dados_gerais['nome'])[0][0][0].upper()
+                if sexo == 'E': sexo = None
+                if self.show_messages:
+                    print('Resultado da tentativa de pegar sexo no site:', sexo)        
+        self.lattes.dados_gerais['sexo'] = sexo
+        self.dados_gerais['sexo'] = sexo
+        if self.show_messages:
+            print('Sexo encontrado:', sexo)
+        return sexo
+
+    @timing
+    def getGender(self, names=None):
+        if names == None:
+            names = self.lattes.dados_gerais['nome']
+        url = ""
+        cnt = 0
+        if not isinstance(names,list):
+            names = [names,]
+        
+        for name in names:
+            if url == "":
+                url = "name[0]=" + name.split(sep=" ", maxsplit=1)[0]
+            else:
+                cnt += 1
+                url = url + "&name[" + str(cnt) + "]=" + name.split(sep=" ", maxsplit=1)[0]
+        url = "https://api.genderize.io?" + url    
+        if self.show_messages: print (url)
+        req = requests.get(url)
+        results = json.loads(req.text)
+        
+        retrn = []
+        for result in results:
+            if self.show_messages: print(result)
+            try:
+                if result["gender"] is not None:
+                    retrn.append((result["gender"], result["probability"], result["count"]))
+                else:
+                    retrn.append((u'None',u'0.0',0.0))
+            except:
+                retrn.append((u'Erro',u'0.0',0.0))
+        return retrn
 
     @timing
     def atualiza (self, 
@@ -423,35 +551,45 @@ class Indicadores:
                 palavras_chave = True, 
                 areas_conhecimento = True, 
                 publicações = True, 
-                dados_pessoais=True,
-                on_conflic_update = True):
-        if self.lattes == None or self.lattes.json == None:
-            print ('ERRRO - Lattes não está carregado. ID:', self.id)
+                dados_gerais=True,
+                vinculos = True,
+                ):
+        if self.erro == True:
+            if self.show_messages: print ('ERRRO - Lattes não está carregado. ID:', self.id)
+            return False
+        if self.lattes == None:
+            if self.show_messages: print ('ERRRO - Lattes não está carregado. ID:', self.id)
             return False
         if indicadores:
             if not self.get_indicadores():
-                print ('ERRRO - Não foi possível carregar Indicadores. ID:', self.id)
-                return False
+                if self.show_messages: print ('ERRRO - Não foi possível carregar Indicadores. ID:', self.id)
             else:
-                self.salva_indicadores_no_bd(on_conflic_update = on_conflic_update)
+                self.salva_indicadores_no_bd()
         if palavras_chave:
             if not self.get_palavras_chave():
-                print ('ERRRO - Não foi possível carregar Indicadores. ID:', self.id)
+                if self.show_messages: print ('ERRRO - Não foi possível carregar as Palavras Chaves. ID:', self.id)
             else:
-                self.salva_palavras_chave_no_bd(on_conflic_update = on_conflic_update)
+                self.salva_palavras_chave_no_bd()
         if areas_conhecimento:
             if not self.get_areas_conhecimento():
-                print ('ERRRO - Não foi possível carregar Áreas do Conhecimento. ID:', self.id)
+                if self.show_messages: print ('ERRRO - Não foi possível carregar Áreas do Conhecimento. ID:', self.id)
             else:
-                self.salva_areas_do_conhecimento_no_bd(on_conflic_update = on_conflic_update)
+                self.salva_areas_do_conhecimento_no_bd()
         if publicações:
             if not self.get_publicações():
-                print ('ERRRO - Não foi possível carregar Publicações. ID:', self.id)
+                if self.show_messages: print ('ERRRO - Não foi possível carregar Publicações. ID:', self.id)
             else:
-                self.salva_publicações_no_bd(on_conflic_update = on_conflic_update)
-        if dados_pessoais:
-            if not self.get_dados_pessoais():
-                print ('ERRRO - Não foi possível carregar Dados Pessoais. ID:', self.id)
-                return False
+                self.salva_publicações_no_bd()
+        if vinculos:
+            if not self.get_vinculos():
+                if self.show_messages: print ('ERRRO - Não foi possível carregar Vínculos. ID:', self.id)
             else:
-                self.salva_dados_pessoais_no_bd(on_conflic_update = on_conflic_update)
+                self.salva_vinculos_no_bd()
+        if dados_gerais:
+            if not self.get_dados_gerais():
+                if self.show_messages: print ('ERRRO - Não foi possível carregar Dados Pessoais. ID:', self.id)
+            else:
+                self.salva_dados_gerais_no_bd()
+
+
+

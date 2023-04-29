@@ -15,8 +15,11 @@ class Lattes:
     def __init__ (self, 
                 id = '1600461423386842',
                 wsdl = 'http://servicosweb.cnpq.br/srvcurriculo/WSCurriculo?wsdl',
+                auto_save_json_to_bd = True,
                 path = None):
         self.id = id
+        self.auto_save_json_to_bd = auto_save_json_to_bd
+        self.update_errors_on_bd = False
         self.nome = None
         self.CPF = None
         self.data_nascimento = None
@@ -28,26 +31,57 @@ class Lattes:
         self.xml = None
         self.soup = None
         self.json = None
-        self.data_atualizacao = None
-        self.bd_data_atualizacao = None
+        self.dt_atualizacao = None
+        self.bd_dt_atualizacao = None
         self.palavras_chave = []
-        self.dados_pessoais = ({
+        self.dados_gerais = ({
             'id': self.id,
             'nome': None,
             'cpf': None,
             'email': None,
             'telefone': None,
-            'chamada': None,
             'sexo': None,
             'regiao': None,
-            'nomes_citacao': None
+            'nomes_citacao': None,
+            'dt_atualizacao': None, 
+            'nacionalidade': None, 
+            'pais_nascimento': None, 
+            'uf_nascimento': None, 
+            'cidade_nascimento': None, 
+            'data_nascimento': None,
+            'data_falecimento': None,
+            'sigla_pais_nacionalidade': None, 
+            'raca_cor': None, 
+            'orcid': None, 
+            'codigo_instituicao_empresa':None,
+            'nome_instituicao_empresa':None,
+            'codigo_orgao':None,
+            'nome_orgao':None,
+            'codigo_unidade':None,
+            'nome_unidade':None,
+            'logradouro_complemento':None,
+            'pais':None,
+            'uf':None,
+            'cep':None,
+            'cidade':None,
+            'bairro':None,
+            'ddd':None,
+            'ramal':None,
+            'fax':None,
+            'caixa_postal':None,
+            'home_page':None,
+            'e_mail':None,
+            'dt_importacao':None,
+
         })
-        if socket.gethostbyname(socket.gethostname()) == '10.30.12.10':
+        if socket.gethostbyname(socket.gethostname()) == '10.10.2.1':
             self.can_get_soap = True
             if self.path == None: self.path = 'c:/Lattes'
         else:
             self.can_get_soap = False
             if self.path == None: self.path = 'd:/Lattes'
+            
+        self.get_lattes()
 
 
 #       ___           ___           ___           ___   
@@ -96,6 +130,9 @@ class Lattes:
                 num_errors += 1
                 print (f'Erro {num_errors}: "{self.ocorrencia}".')
                 if self.ocorrencia == 'Nenhum curriculo encontrado!' or self.ocorrencia == 'Mais de um curriculo atende ao criterio informado!' or self.ocorrencia == 'Nenhum curriculo encontrado!':
+                    if self.update_errors_on_bd:
+                        sql = "UPDATE public.all_lattes SET erro = True WHERE id = %s"
+                        self.bd.execute(sql, (self.id,))
                     return self.ocorrencia
                 tempo_a_dormir = (num_errors*4)**2
                 print(f'Esperando {tempo_a_dormir} segundos.')
@@ -107,6 +144,8 @@ class Lattes:
                 if set_auto_save:
                     self.save_zip_to_disk(path)
                     print('Lattes salvo no disco.')
+                if self.auto_save_json_to_bd and not self.json == None:
+                    self.insert_json()
                 return self.ocorrencia
             elif num_errors >= 3:
                 return self.ocorrencia
@@ -120,11 +159,11 @@ class Lattes:
             self.id = id
         if self.can_get_soap:
             client = zeep.Client(wsdl=self.wsdl)
-            self.data_atualizacao = client.service.getDataAtualizacaoCV(self.id)
-            if self.data_atualizacao == None:
+            self.dt_atualizacao = client.service.getDataAtualizacaoCV(self.id)
+            if self.dt_atualizacao == None:
                 raise ValueError('Invalid ID')
             else:
-                self.data_atualizacao = datetime.strptime(self.data_atualizacao, '%d/%m/%Y %H:%M:%S').replace(tzinfo=pytz.UTC)
+                self.dt_atualizacao = datetime.strptime(self.dt_atualizacao, '%d/%m/%Y %H:%M:%S').replace(tzinfo=pytz.UTC)
                 return True
         else:
             return False
@@ -184,17 +223,17 @@ class Lattes:
             ON CONFLICT (id)
             DO
             UPDATE SET
-            json = EXCLUDED.json,
+            json = EXCLUDED.json
             ;
             """
-        data = (id,
+        data = (self.id,
                 json.dumps(self.json)
                )
         self.bd.execute(sql, data)
 
     def insert_lattes_atualizacao_bd(self):
-        if self.id == None or self.data_atualizacao == None:
-            raise Exception('No id or data_atualizacao to insert.')
+        if self.id == None or self.dt_atualizacao == None:
+            raise Exception('No id or dt_atualizacao to insert.')
         sql = """INSERT INTO public."lattes_atualizacao"(
             id, last_updated)
             VALUES(%s, TIMESTAMP %s)
@@ -206,7 +245,7 @@ class Lattes:
             ;
             """
         data = (self.id,
-                self.data_atualizacao.strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                self.dt_atualizacao.strftime('%Y-%m-%dT%H:%M:%S.%f'))
         self.bd.execute(sql, data)
 
     def insert_palavras_chave_no_bd (self, data):
@@ -214,14 +253,69 @@ class Lattes:
         data = ({'id': self.id, 'palavra': palavra} for palavra in self.palavras_chave)
         self.bd.execute(sql, data)
 
-    def insere_dados_pessoais_no_bd(self):
+    def insere_dados_gerais_no_bd(self, on_conflict = True):
         sql = '''
-            INSERT INTO public."dados_pessoais"
-                (id, nome, cpf, email, telefone, chamada, sexo, regiao, nomes_citacao)
-                VALUES
-                (%(id)s, %(nome)s, %(cpf)s, %(email)s, %(telefone)s, %(chamada)s, %(sexo)s, %(regiao)s, %(nomes_citacao)s) ;
+            INSERT INTO public."dados_gerais"
+               (id, nome, cpf, email, telefone, sexo, regiao, nomes_citacao, dt_atualizacao, 
+               nacionalidade, pais_nascimento, uf_nascimento, cidade_nascimento, data_nascimento, 
+               data_falecimento, sigla_pais_nacionalidade, raca_cor, orcid, 
+               codigo_instituicao_empresa, nome_instituicao_empresa, codigo_orgao, 
+               nome_orgao, codigo_unidade, nome_unidade, logradouro_complemento, pais, uf, cep, 
+               cidade, bairro, ddd, ramal, fax, caixa_postal, home_page, e_mail)
+            VALUES
+                (%(id)s, %(nome)s, %(cpf)s, %(email)s, %(telefone)s, %(sexo)s, %(regiao)s, %(nomes_citacao)s, %(dt_atualizacao)s,
+                %(nacionalidade)s, %(pais_nascimento)s, %(uf_nascimento)s, %(cidade_nascimento)s, %(data_nascimento)s,
+                %(data_falecimento)s, %(sigla_pais_nacionalidade)s, %(raca_cor)s, %(orcid)s,
+                %(codigo_instituicao_empresa)s, %(nome_instituicao_empresa)s, %(codigo_orgao)s,
+                %(nome_orgao)s, %(codigo_unidade)s, %(nome_unidade)s, %(logradouro_complemento)s, %(pais)s, %(uf)s, %(cep)s,
+                %(cidade)s, %(bairro)s, %(ddd)s, %(ramal)s, %(fax)s, %(caixa_postal)s, %(home_page)s, %(e_mail)s)
+           
             '''
-        self.bd.execute(sql, self.dados_pessoais)
+        if on_conflict:
+            sql += '''
+            ON CONFLICT (id) DO UPDATE SET
+                nome = excluded.nome,
+                cpf = excluded.cpf,
+                email = excluded.email,
+                telefone = excluded.telefone,
+                sexo = excluded.sexo,
+                regiao = excluded.regiao,
+                nomes_citacao = excluded.nomes_citacao,
+                dt_atualizacao  = excluded.dt_atualizacao ,
+                nacionalidade  = excluded.nacionalidade ,
+                pais_nascimento  = excluded.pais_nascimento ,
+                uf_nascimento  = excluded.uf_nascimento ,
+                cidade_nascimento  = excluded.cidade_nascimento ,
+                data_nascimento = excluded.data_nascimento,
+                data_falecimento = excluded.data_falecimento,
+                sigla_pais_nacionalidade  = excluded.sigla_pais_nacionalidade ,
+                raca_cor  = excluded.raca_cor ,
+                orcid  = excluded.orcid ,
+                codigo_instituicao_empresa = excluded.codigo_instituicao_empresa,
+                nome_instituicao_empresa = excluded.nome_instituicao_empresa,
+                codigo_orgao = excluded.codigo_orgao,
+                nome_orgao = excluded.nome_orgao,
+                codigo_unidade = excluded.codigo_unidade,
+                nome_unidade = excluded.nome_unidade,
+                logradouro_complemento = excluded.logradouro_complemento,
+                pais = excluded.pais,
+                uf = excluded.uf,
+                cep = excluded.cep,
+                cidade = excluded.cidade,
+                bairro = excluded.bairro,
+                ddd = excluded.ddd,
+                ramal = excluded.ramal,
+                fax = excluded.fax,
+                caixa_postal = excluded.caixa_postal,
+                home_page = excluded.home_page,
+                e_mail = excluded.e_mail
+            '''
+        else:
+            sql += '''
+            ON CONFLICT DO NOTHING
+            '''
+        sql +=';'
+        self.bd.execute(sql, self.dados_gerais)
 
 
 #  _____  _____ _____
@@ -262,14 +356,17 @@ class Lattes:
             return True
         return False
 
-    def get_lattes_atualizacao_bd(self):
-        sql = """SELECT created_at, last_updated from public."lattes_atualizacao"
+    def get_atualizacao_SOAP(self):
+        sql = """SELECT 
+            dt_atualizacao as created_at, 
+            dt_importacao as last_updated
+        from public.dados_gerais
         where id = %s;
         """
         data = (self.id,)
         resultado = self.bd.query(sql, data, many=False)
         if not resultado == None:
-            self.bd_data_atualizacao = resultado[0].replace(tzinfo=pytz.UTC)
+            self.bd_dt_atualizacao = resultado[0].replace(tzinfo=pytz.UTC)
             self.bd_created_at = resultado[1].replace(tzinfo=pytz.UTC)
             return True
         return False
@@ -294,12 +391,11 @@ class Lattes:
 
     def get_lattes (self):
         conseguiu = True
-        if not self.read_json_from_disk():
-            if not self.get_json_bd():
-                if not self.read_zip_from_disk ():
-                    conseguiu = self.get_zip_from_SOAP()
-                if conseguiu:
-                    conseguiu = self.get_xml()
+        if not self.read_zip_from_disk ():
+            conseguiu = self.get_zip_from_SOAP()
+        if conseguiu:
+            conseguiu = self.get_xml()
+            self.get_dados_gerais_by_xml()
         return conseguiu
 
     @staticmethod
@@ -326,6 +422,7 @@ class Lattes:
                 if get_from_SOAP_if_not_exists and self.can_get_soap:
                     return self.get_zip_from_SOAP()
                 else: return False
+
         except:
             return False
         return True
@@ -454,12 +551,17 @@ class Lattes:
                 self.json = xmltodict.parse(self.xml)
                 self.json = self.recorre_sobre_todo_json(self.json)
                 self.xml = self.xml.decode('iso-8859-1').replace('encoding="ISO-8859-1" ', '')
+            if self.auto_save_json_to_bd:
+                self.insert_json()
             return True
         except:
+            if self.update_errors_on_bd:
+                sql = "UPDATE public.all_lattes SET erro = True WHERE id = %s"
+                self.bd.execute(sql, (self.id,))
             return False
 
 
-    def get_id_by_xml (self):
+    def get_dados_gerais_by_xml (self):
         if self.xml == None: return None
         if not (
                 type(self.soup) == BeautifulSoup or
@@ -467,10 +569,45 @@ class Lattes:
             self.soup = BeautifulSoup(self.xml, "xml")
         id = self.soup.find('CURRICULO-VITAE').get('NUMERO-IDENTIFICADOR')
         if id == None:
-            self.dados_pessoais['id'] = self.id
+            self.dados_gerais['id'] = self.id
         data = self.soup.find('CURRICULO-VITAE').get('DATA-ATUALIZACAO')
         hora = self.soup.find('CURRICULO-VITAE').get('HORA-ATUALIZACAO')
-        self.dados_pessoais['data_atualizacao'] = datetime.strptime(data + hora, '%d%m%Y%H%M%S')
-        self.dados_pessoais['nome'] = self.soup.find('DADOS-GERAIS').get('NOME-COMPLETO')
-        self.dados_pessoais['nacionalidade'] = self.soup.find('DADOS-GERAIS').get('PAIS-DE-NACIONALIDADE')
-        self.dados_pessoais['nomes_citacao'] = self.soup.find('DADOS-GERAIS').get('NOME-EM-CITACOES-BIBLIOGRAFICAS')
+        try:
+            self.dados_gerais['dt_atualizacao'] = datetime.strptime(data + hora, '%d%m%Y%H%M%S')
+        except:
+            self.dados_gerais['dt_atualizacao'] = None
+        self.dados_gerais['nome'] = self.soup.find('DADOS-GERAIS').get('NOME-COMPLETO')
+        self.dados_gerais['nacionalidade'] = self.soup.find('DADOS-GERAIS').get('PAIS-DE-NACIONALIDADE')
+        self.dados_gerais['nomes_citacao'] = self.soup.find('DADOS-GERAIS').get('NOME-EM-CITACOES-BIBLIOGRAFICAS')
+        self.dados_gerais['pais_nascimento'] = self.soup.find('DADOS-GERAIS').get('PAIS-DE-NASCIMENTO')
+        self.dados_gerais['uf_nascimento'] = self.soup.find('DADOS-GERAIS').get('UF-NASCIMENTO')
+        self.dados_gerais['cidade_nascimento'] = self.soup.find('DADOS-GERAIS').get('CIDADE-NASCIMENTO')
+        self.dados_gerais['data_nascimento'] = self.soup.find('DADOS-GERAIS').get('DATA-NASCIMENTO')
+        self.dados_gerais['cidade_nascimento'] = self.soup.find('DADOS-GERAIS').get('CIDADE-NASCIMENTO')
+        self.dados_gerais['sexo'] = self.soup.find('DADOS-GERAIS').get('SEXO')
+        self.dados_gerais['data_falecimento'] = self.soup.find('DADOS-GERAIS').get('DATA-FALECIMENTO')
+        self.dados_gerais['sigla_pais_nacionalidade'] = self.soup.find('DADOS-GERAIS').get('SIGLA-PAIS-NACIONALIDADE')
+        self.dados_gerais['nacionalidade'] = self.soup.find('DADOS-GERAIS').get('PAIS-DE-NACIONALIDADE')
+        self.dados_gerais['raca_cor'] = self.soup.find('DADOS-GERAIS').get('RACA-OU-COR')
+        self.dados_gerais['orcid'] = self.soup.find('DADOS-GERAIS').get('ORCID-ID')
+        self.dados_gerais['cidade_nascimento'] = self.soup.find('DADOS-GERAIS').get('CIDADE-NASCIMENTO')
+        if not self.soup.find('ENDERECO-PROFISSIONAL') == None:
+            self.dados_gerais['codigo_instituicao_empresa'] = self.soup.find('ENDERECO-PROFISSIONAL').get('CODIGO-INSTITUICAO-EMPRESA')
+            self.dados_gerais['codigo_orgao'] = self.soup.find('ENDERECO-PROFISSIONAL').get('CODIGO-ORGAO')
+            self.dados_gerais['nome_orgao'] = self.soup.find('ENDERECO-PROFISSIONAL').get('NOME-ORGAO')
+            self.dados_gerais['codigo_unidade'] = self.soup.find('ENDERECO-PROFISSIONAL').get('CODIGO-UNIDADE')
+            self.dados_gerais['nome_unidade'] = self.soup.find('ENDERECO-PROFISSIONAL').get('NOME-UNIDADE')
+            self.dados_gerais['logradouro_complemento'] = self.soup.find('ENDERECO-PROFISSIONAL').get('LOGRADOURO-COMPLEMENTO')
+            self.dados_gerais['pais'] = self.soup.find('ENDERECO-PROFISSIONAL').get('PAIS')
+            self.dados_gerais['uf'] = self.soup.find('ENDERECO-PROFISSIONAL').get('UF')
+            self.dados_gerais['cep'] = self.soup.find('ENDERECO-PROFISSIONAL').get('CEP')
+            self.dados_gerais['cidade'] = self.soup.find('ENDERECO-PROFISSIONAL').get('CIDADE')
+            self.dados_gerais['bairro'] = self.soup.find('ENDERECO-PROFISSIONAL').get('BAIRRO')
+            self.dados_gerais['ddd'] = self.soup.find('ENDERECO-PROFISSIONAL').get('DDD')
+            self.dados_gerais['telefone'] = self.soup.find('ENDERECO-PROFISSIONAL').get('TELEFONE')
+            self.dados_gerais['ramal'] = self.soup.find('ENDERECO-PROFISSIONAL').get('RAMAL')
+            self.dados_gerais['fax'] = self.soup.find('ENDERECO-PROFISSIONAL').get('FAX')
+            self.dados_gerais['caixa_postal'] = self.soup.find('ENDERECO-PROFISSIONAL').get('CAIXA-POSTAL')
+            self.dados_gerais['e_mail'] = self.soup.find('ENDERECO-PROFISSIONAL').get('E-MAIL')
+            self.dados_gerais['home_page'] = self.soup.find('ENDERECO-PROFISSIONAL').get('HOME-PAGE')
+        self.dados_gerais['dt_importacao'] = datetime.now()
